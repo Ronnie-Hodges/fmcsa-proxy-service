@@ -22,7 +22,7 @@ app.get('/api/search-trucking', async (req, res) => {
             searchMode: "byName",
             companyName: companyName,
             maxResults: 20,
-            enrichWithWebSearch: false
+            enrichWithWebSearch: true // Enabled to pull websites, social media links, and digital data if available
         });
 
         const { items } = await client.dataset(run.defaultDatasetId).listItems();
