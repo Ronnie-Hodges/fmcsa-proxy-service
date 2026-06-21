@@ -34,51 +34,96 @@ app.get('/api/search-trucking', async (req, res) => {
 
 // ---------- NEW: combinable filter search, direct from FMCSA's Socrata dataset ----------
 // No Apify, no per-record cost - this queries data.transportation.gov directly.
-// Dataset: Company Census File (az4n-8mr2)
+// Dataset: Company Census File (az4n-8mr2) - all field names below verified against
+// the live column schema, not guessed from the PDF data dictionary.
 const SOCRATA_BASE_URL = 'https://data.transportation.gov/resource/az4n-8mr2.json';
 
 function escapeSoQLString(val) {
-    // Prevent SoQL injection by doubling single quotes, same idea as SQL escaping
     return String(val).replace(/'/g, "''");
 }
+
+// Maps a friendly cargoType query value to its real column name.
+// Every value here was confirmed against the dataset's actual schema.
+const CARGO_TYPE_MAP = {
+    generalfreight: 'crgo_genfreight',
+    household: 'crgo_household',
+    metalsheet: 'crgo_metalsheet',
+    motorvehicles: 'crgo_motoveh',
+    drivetow: 'crgo_drivetow',
+    logpole: 'crgo_logpole',
+    buildingmaterials: 'crgo_bldgmat',
+    mobilehome: 'crgo_mobilehome',
+    machinery: 'crgo_machlrg',
+    produce: 'crgo_produce',
+    liquidsgases: 'crgo_liqgas',
+    intermodal: 'crgo_intermodal',
+    passengers: 'crgo_passengers',
+    oilfield: 'crgo_oilfield',
+    livestock: 'crgo_livestock',
+    grainfeed: 'crgo_grainfeed',
+    coalcoke: 'crgo_coalcoke',
+    meat: 'crgo_meat',
+    garbage: 'crgo_garbage',
+    usmail: 'crgo_usmail',
+    chemicals: 'crgo_chem',
+    drybulk: 'crgo_drybulk',
+    refrigerated: 'crgo_coldfood',
+    beverages: 'crgo_beverages',
+    paperproducts: 'crgo_paperprod',
+    utility: 'crgo_utility',
+    farmsupplies: 'crgo_farmsupp',
+    construction: 'crgo_construct',
+    waterwell: 'crgo_waterwell',
+    other: 'crgo_cargoothr'
+};
 
 app.get('/api/census-search', async (req, res) => {
     try {
         const {
-            state,             // e.g. "GA" - real filter
-            carrierOperation,  // "A" = Authorized for Hire, "B" = Exempt, "C" = Private
-            hazmat,            // "true" / "false"
+            state,
+            carrierOperation,
+            hazmat,
             minPowerUnits,
             maxPowerUnits,
             minTruckUnits,
             maxTruckUnits,
-            excludeBuses,      // "true" - only carriers with 0 bus_units
+            excludeBuses,
             minDrivers,
             maxDrivers,
-            businessOrgDesc,   // "INDIVIDUAL" or "CORPORATION" - partial match
-            classContains,     // free-text match against classdef (e.g. "EXEMPT", "PRIVATE")
+            businessOrgDesc,
+            classContains,
             minMileage,
             maxMileage,
-            city,              // partial match
-            zipPrefix,         // e.g. "300" matches all 300xx zips
-            status,            // "active" (default), "inactive", or "all"
-            mcs150After,       // YYYY-MM-DD
-            mcs150Before,      // YYYY-MM-DD
-            sortBy,            // "recent" (default), "oldest", or "none"
+            city,
+            zipPrefix,
+            minOwnTrucks,      // owntruck - owned straight trucks
+            maxOwnTrucks,
+            minOwnTractors,    // owntract - owned tractors (semi trucks)
+            maxOwnTractors,
+            minOwnTrailers,    // owntrail - owned trailers
+            maxOwnTrailers,
+            cargoType,         // one key from CARGO_TYPE_MAP above
+            status,
+            mcs150After,
+            mcs150Before,
+            sortBy,
             maxResults
         } = req.query;
 
-        // Require at least one real filter so we never accidentally pull the whole 4.4M file
         if (!state && !carrierOperation && !hazmat) {
             return res.status(400).json({
                 error: 'At least one of state, carrierOperation, or hazmat is required.'
             });
         }
 
+        if (cargoType && !CARGO_TYPE_MAP[cargoType]) {
+            return res.status(400).json({
+                error: `Invalid cargoType. Valid options: ${Object.keys(CARGO_TYPE_MAP).join(', ')}`
+            });
+        }
+
         const targetCount = Math.min(parseInt(maxResults, 10) || 500, 1000);
 
-        // Every filter below runs as a real SoQL $where condition - Socrata filters
-        // server-side, so there's no need to over-fetch and filter in JavaScript.
         const conditions = [];
         if (state) conditions.push(`phy_state = '${escapeSoQLString(state.toUpperCase())}'`);
         if (carrierOperation) conditions.push(`carrier_operation = '${escapeSoQLString(carrierOperation.toUpperCase())}'`);
@@ -87,7 +132,7 @@ app.get('/api/census-search', async (req, res) => {
         const statusFilter = (status || 'active').toLowerCase();
         if (statusFilter === 'active') conditions.push(`status_code = 'A'`);
         else if (statusFilter === 'inactive') conditions.push(`status_code = 'I'`);
-        // statusFilter === 'all' -> no condition added, leaves both
+        else if (statusFilter === 'pending') conditions.push(`status_code = 'P'`);
 
         if (minPowerUnits) conditions.push(`power_units >= ${parseInt(minPowerUnits, 10)}`);
         if (maxPowerUnits) conditions.push(`power_units <= ${parseInt(maxPowerUnits, 10)}`);
@@ -102,13 +147,18 @@ app.get('/api/census-search', async (req, res) => {
         if (maxMileage) conditions.push(`mcs150_mileage <= ${parseInt(maxMileage, 10)}`);
         if (city) conditions.push(`upper(phy_city) like upper('%${escapeSoQLString(city)}%')`);
         if (zipPrefix) conditions.push(`starts_with(phy_zip, '${escapeSoQLString(zipPrefix)}')`);
+        if (minOwnTrucks) conditions.push(`owntruck >= ${parseInt(minOwnTrucks, 10)}`);
+        if (maxOwnTrucks) conditions.push(`owntruck <= ${parseInt(maxOwnTrucks, 10)}`);
+        if (minOwnTractors) conditions.push(`owntract >= ${parseInt(minOwnTractors, 10)}`);
+        if (maxOwnTractors) conditions.push(`owntract <= ${parseInt(maxOwnTractors, 10)}`);
+        if (minOwnTrailers) conditions.push(`owntrail >= ${parseInt(minOwnTrailers, 10)}`);
+        if (maxOwnTrailers) conditions.push(`owntrail <= ${parseInt(maxOwnTrailers, 10)}`);
+        if (cargoType) conditions.push(`${CARGO_TYPE_MAP[cargoType]} = 'X'`);
         if (mcs150After) conditions.push(`mcs150_date >= '${escapeSoQLString(mcs150After)}T00:00:00'`);
         if (mcs150Before) conditions.push(`mcs150_date <= '${escapeSoQLString(mcs150Before)}T23:59:59'`);
 
         const sortMode = (sortBy || 'recent').toLowerCase();
         const orderClause = sortMode === 'none' ? '' : `mcs150_date ${sortMode === 'oldest' ? 'ASC' : 'DESC'}`;
-        // When sorting by recency, exclude carriers with no mcs150_date at all -
-        // those are often decades-old registrations that never filed, not recent leads.
         if (sortMode !== 'none') conditions.push(`mcs150_date IS NOT NULL`);
 
         const params = new URLSearchParams();
@@ -136,6 +186,8 @@ app.get('/api/census-search', async (req, res) => {
                 state, carrierOperation, hazmat, minPowerUnits, maxPowerUnits,
                 minTruckUnits, maxTruckUnits, excludeBuses, minDrivers, maxDrivers,
                 businessOrgDesc, classContains, minMileage, maxMileage, city, zipPrefix,
+                minOwnTrucks, maxOwnTrucks, minOwnTractors, maxOwnTractors,
+                minOwnTrailers, maxOwnTrailers, cargoType,
                 status: statusFilter, mcs150After, mcs150Before
             },
             results: items
