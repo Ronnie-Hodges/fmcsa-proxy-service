@@ -11,7 +11,7 @@ const client = new ApifyClient({
     token: process.env.APIFY_TOKEN
 });
 
-// ---------- EXISTING: single-carrier lookup by name/DOT/MC ----------
+// ---------- EXISTING: single-carrier lookup by name/DOT/MC (still via Apify) ----------
 app.get('/api/search-trucking', async (req, res) => {
     try {
         const { companyName } = req.query;
@@ -32,18 +32,39 @@ app.get('/api/search-trucking', async (req, res) => {
     }
 });
 
-// ---------- NEW: combinable filter search across the full census ----------
-// Real server-side filters: state, carrierOperation, hazmat
-// Refine-only filters (applied after the real data comes back): minPowerUnits, maxPowerUnits, cargoType
+// ---------- NEW: combinable filter search, direct from FMCSA's Socrata dataset ----------
+// No Apify, no per-record cost - this queries data.transportation.gov directly.
+// Dataset: Company Census File (az4n-8mr2)
+const SOCRATA_BASE_URL = 'https://data.transportation.gov/resource/az4n-8mr2.json';
+
+function escapeSoQLString(val) {
+    // Prevent SoQL injection by doubling single quotes, same idea as SQL escaping
+    return String(val).replace(/'/g, "''");
+}
+
 app.get('/api/census-search', async (req, res) => {
     try {
         const {
-            state,            // e.g. "GA" - real federal filter
-            carrierOperation, // "A" = Authorized for Hire, "B" = Exempt, "C" = Private
-            hazmat,           // "true" / "false" - real federal filter
-            minPowerUnits,    // refine-only, applied after fetch
-            maxPowerUnits,    // refine-only, applied after fetch
-            cargoType,        // refine-only, applied after fetch
+            state,             // e.g. "GA" - real filter
+            carrierOperation,  // "A" = Authorized for Hire, "B" = Exempt, "C" = Private
+            hazmat,            // "true" / "false"
+            minPowerUnits,
+            maxPowerUnits,
+            minTruckUnits,
+            maxTruckUnits,
+            excludeBuses,      // "true" - only carriers with 0 bus_units
+            minDrivers,
+            maxDrivers,
+            businessOrgDesc,   // "INDIVIDUAL" or "CORPORATION" - partial match
+            classContains,     // free-text match against classdef (e.g. "EXEMPT", "PRIVATE")
+            minMileage,
+            maxMileage,
+            city,              // partial match
+            zipPrefix,         // e.g. "300" matches all 300xx zips
+            status,            // "active" (default), "inactive", or "all"
+            mcs150After,       // YYYY-MM-DD
+            mcs150Before,      // YYYY-MM-DD
+            sortBy,            // "recent" (default), "oldest", or "none"
             maxResults
         } = req.query;
 
@@ -54,43 +75,71 @@ app.get('/api/census-search', async (req, res) => {
             });
         }
 
-        const cappedMax = Math.min(parseInt(maxResults, 10) || 500, 1000); // hard cost ceiling
+        const targetCount = Math.min(parseInt(maxResults, 10) || 500, 1000);
 
-        const actorInput = {
-            maxResults: cappedMax
-        };
-        if (state) actorInput.state = state.toUpperCase();
-        if (carrierOperation) actorInput.carrierOperation = carrierOperation.toUpperCase();
-        if (hazmat === 'true') actorInput.hazmat = true;
+        // Every filter below runs as a real SoQL $where condition - Socrata filters
+        // server-side, so there's no need to over-fetch and filter in JavaScript anymore.
+        const conditions = [];
+        if (state) conditions.push(`phy_state = '${escapeSoQLString(state.toUpperCase())}'`);
+        if (carrierOperation) conditions.push(`carrier_operation = '${escapeSoQLString(carrierOperation.toUpperCase())}'`);
+        if (hazmat === 'true') conditions.push(`hm_ind = 'Y'`);
 
-        const run = await client.actor("compute-edge/fmcsa-motor-carriers-scraper").call(actorInput);
-        let { items } = await client.dataset(run.defaultDatasetId).listItems();
+        const statusFilter = (status || 'active').toLowerCase();
+        if (statusFilter === 'active') conditions.push(`status_code = 'A'`);
+        else if (statusFilter === 'inactive') conditions.push(`status_code = 'I'`);
+        // statusFilter === 'all' -> no condition added, leaves both
 
-        // Refine-only filters applied to the real result set
-        if (minPowerUnits) {
-            const min = parseInt(minPowerUnits, 10);
-            items = items.filter(c => parseInt(c.powerUnits || c.totalPowerUnits || 0, 10) >= min);
+        if (minPowerUnits) conditions.push(`power_units >= ${parseInt(minPowerUnits, 10)}`);
+        if (maxPowerUnits) conditions.push(`power_units <= ${parseInt(maxPowerUnits, 10)}`);
+        if (minTruckUnits) conditions.push(`truck_units >= ${parseInt(minTruckUnits, 10)}`);
+        if (maxTruckUnits) conditions.push(`truck_units <= ${parseInt(maxTruckUnits, 10)}`);
+        if (excludeBuses === 'true') conditions.push(`bus_units = 0`);
+        if (minDrivers) conditions.push(`total_drivers >= ${parseInt(minDrivers, 10)}`);
+        if (maxDrivers) conditions.push(`total_drivers <= ${parseInt(maxDrivers, 10)}`);
+        if (businessOrgDesc) conditions.push(`upper(business_org_desc) like upper('%${escapeSoQLString(businessOrgDesc)}%')`);
+        if (classContains) conditions.push(`upper(classdef) like upper('%${escapeSoQLString(classContains)}%')`);
+        if (minMileage) conditions.push(`mcs150_mileage >= ${parseInt(minMileage, 10)}`);
+        if (maxMileage) conditions.push(`mcs150_mileage <= ${parseInt(maxMileage, 10)}`);
+        if (city) conditions.push(`upper(phy_city) like upper('%${escapeSoQLString(city)}%')`);
+        if (zipPrefix) conditions.push(`starts_with(phy_zip, '${escapeSoQLString(zipPrefix)}')`);
+        if (mcs150After) conditions.push(`mcs150_date >= '${escapeSoQLString(mcs150After)}T00:00:00'`);
+        if (mcs150Before) conditions.push(`mcs150_date <= '${escapeSoQLString(mcs150Before)}T23:59:59'`);
+
+        const sortMode = (sortBy || 'recent').toLowerCase();
+        const orderClause = sortMode === 'none' ? '' : `mcs150_date ${sortMode === 'oldest' ? 'ASC' : 'DESC'}`;
+
+        const params = new URLSearchParams();
+        params.set('$where', conditions.join(' AND '));
+        params.set('$limit', targetCount.toString());
+        if (orderClause) params.set('$order', orderClause);
+
+        const url = `${SOCRATA_BASE_URL}?${params.toString()}`;
+
+        const socrataRes = await fetch(url, {
+            headers: { 'X-App-Token': process.env.SOCRATA_APP_TOKEN }
+        });
+
+        if (!socrataRes.ok) {
+            const errText = await socrataRes.text();
+            console.error('Socrata API Error:', socrataRes.status, errText);
+            return res.status(502).json({ error: 'Failed to query the FMCSA census database.' });
         }
-        if (maxPowerUnits) {
-            const max = parseInt(maxPowerUnits, 10);
-            items = items.filter(c => parseInt(c.powerUnits || c.totalPowerUnits || 0, 10) <= max);
-        }
-        if (cargoType) {
-            const needle = cargoType.toLowerCase();
-            items = items.filter(c => {
-                const cargo = Array.isArray(c.cargoCarried) ? c.cargoCarried.join(' ') : (c.cargoCarried || '');
-                return cargo.toLowerCase().includes(needle);
-            });
-        }
+
+        const items = await socrataRes.json();
 
         res.json({
             count: items.length,
-            requestedFilters: { state, carrierOperation, hazmat, minPowerUnits, maxPowerUnits, cargoType },
+            requestedFilters: {
+                state, carrierOperation, hazmat, minPowerUnits, maxPowerUnits,
+                minTruckUnits, maxTruckUnits, excludeBuses, minDrivers, maxDrivers,
+                businessOrgDesc, classContains, minMileage, maxMileage, city, zipPrefix,
+                status: statusFilter, mcs150After, mcs150Before
+            },
             results: items
         });
 
     } catch (error) {
-        console.error('Census Search Proxy Error:', error.message);
+        console.error('Census Search Error:', error.message);
         res.status(500).json({ error: 'Failed to query the FMCSA census database.' });
     }
 });
