@@ -78,7 +78,7 @@ app.get('/api/census-search', async (req, res) => {
         const targetCount = Math.min(parseInt(maxResults, 10) || 500, 1000);
 
         // Every filter below runs as a real SoQL $where condition - Socrata filters
-        // server-side, so there's no need to over-fetch and filter in JavaScript anymore.
+        // server-side, so there's no need to over-fetch and filter in JavaScript.
         const conditions = [];
         if (state) conditions.push(`phy_state = '${escapeSoQLString(state.toUpperCase())}'`);
         if (carrierOperation) conditions.push(`carrier_operation = '${escapeSoQLString(carrierOperation.toUpperCase())}'`);
@@ -107,6 +107,9 @@ app.get('/api/census-search', async (req, res) => {
 
         const sortMode = (sortBy || 'recent').toLowerCase();
         const orderClause = sortMode === 'none' ? '' : `mcs150_date ${sortMode === 'oldest' ? 'ASC' : 'DESC'}`;
+        // When sorting by recency, exclude carriers with no mcs150_date at all -
+        // those are often decades-old registrations that never filed, not recent leads.
+        if (sortMode !== 'none') conditions.push(`mcs150_date IS NOT NULL`);
 
         const params = new URLSearchParams();
         params.set('$where', conditions.join(' AND '));
