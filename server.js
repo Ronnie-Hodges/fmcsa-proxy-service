@@ -287,6 +287,7 @@ const CRASH_FILE_URL = 'https://data.transportation.gov/resource/aayw-vxb3.json'
 const VEHICLE_INSPECTION_URL = 'https://data.transportation.gov/resource/fx4q-ay7w.json';
 const INSPECTIONS_PER_UNIT_URL = 'https://data.transportation.gov/resource/wt8s-2hbx.json';
 const ACTIVE_INSURANCE_URL = 'https://data.transportation.gov/resource/qh9u-swkp.json';
+const INSURANCE_HISTORY_URL = 'https://data.transportation.gov/resource/6sqe-dvqs.json';
 
 async function socrataGet(baseUrl, whereClause, limit) {
     const params = new URLSearchParams();
@@ -574,11 +575,22 @@ app.get('/api/full-report', async (req, res) => {
             decodedVehicle: inspectedVinDecoded[v.insp_unit_vehicle_id_number] || null
         }));
 
-        // Active/Pending insurance filings - dot_number in this dataset is zero-padded
-        // text (e.g. "00893864"), unlike the plain numeric format in the Census File.
+        // Insurance - dot_number in both insurance datasets is zero-padded text
+        // (e.g. "00893864"), unlike the plain numeric format in the Census File.
         const paddedDot = String(parseInt(dotNumber, 10)).padStart(8, '0');
-        const insurancePolicies = await socrataGet(
+
+        // Currently active or pending policies - empty here is common for inactive
+        // carriers, since a lapsed/cancelled policy moves to InsHist instead.
+        const activePolicies = await socrataGet(
             ACTIVE_INSURANCE_URL,
+            `dot_number = '${paddedDot}'`,
+            25
+        );
+
+        // Historical/cancelled policies - useful for inactive carriers, and as a red
+        // flag for active ones if a policy was cancelled with nothing replacing it.
+        const historicalPolicies = await socrataGet(
+            INSURANCE_HISTORY_URL,
             `dot_number = '${paddedDot}'`,
             25
         );
@@ -594,8 +606,10 @@ app.get('/api/full-report', async (req, res) => {
                 inspectedVehicleCount: inspectedVehiclesWithDetail.length
             },
             insurance: {
-                policies: insurancePolicies || [],
-                policyCount: insurancePolicies ? insurancePolicies.length : 0
+                activePolicies: activePolicies || [],
+                activePolicyCount: activePolicies ? activePolicies.length : 0,
+                historicalPolicies: historicalPolicies || [],
+                historicalPolicyCount: historicalPolicies ? historicalPolicies.length : 0
             }
         });
 
