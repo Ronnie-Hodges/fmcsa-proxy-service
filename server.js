@@ -286,6 +286,7 @@ app.get('/api/census-search', async (req, res) => {
 const CRASH_FILE_URL = 'https://data.transportation.gov/resource/aayw-vxb3.json';
 const VEHICLE_INSPECTION_URL = 'https://data.transportation.gov/resource/fx4q-ay7w.json';
 const INSPECTIONS_PER_UNIT_URL = 'https://data.transportation.gov/resource/wt8s-2hbx.json';
+const ACTIVE_INSURANCE_URL = 'https://data.transportation.gov/resource/qh9u-swkp.json';
 
 async function socrataGet(baseUrl, whereClause, limit) {
     const params = new URLSearchParams();
@@ -573,6 +574,15 @@ app.get('/api/full-report', async (req, res) => {
             decodedVehicle: inspectedVinDecoded[v.insp_unit_vehicle_id_number] || null
         }));
 
+        // Active/Pending insurance filings - dot_number in this dataset is zero-padded
+        // text (e.g. "00893864"), unlike the plain numeric format in the Census File.
+        const paddedDot = String(parseInt(dotNumber, 10)).padStart(8, '0');
+        const insurancePolicies = await socrataGet(
+            ACTIVE_INSURANCE_URL,
+            `dot_number = '${paddedDot}'`,
+            25
+        );
+
         res.json({
             census: censusRecord,
             enrich: {
@@ -582,6 +592,10 @@ app.get('/api/full-report', async (req, res) => {
                 inspectionCount: inspections ? inspections.length : 0,
                 inspectedVehicles: inspectedVehiclesWithDetail,
                 inspectedVehicleCount: inspectedVehiclesWithDetail.length
+            },
+            insurance: {
+                policies: insurancePolicies || [],
+                policyCount: insurancePolicies ? insurancePolicies.length : 0
             }
         });
 
